@@ -18,6 +18,8 @@ from uuid import uuid4
 
 from pydantic_ai.messages import BinaryContent, ModelMessage, ModelMessagesTypeAdapter
 
+from app.agents.tool_errors import mark_tool_errors
+
 EPHEMERAL = "ephemeral-"
 """The prefix of an ephemeral picture's `identifier`, which survives serialization."""
 
@@ -60,6 +62,9 @@ def without_ephemeral(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def dump_messages(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]:
     """Messages as JSON to store, without the pictures nobody keeps."""
+    # A controlled string loses its subclass when serialized. Keep its provenance
+    # beside the part, including for a run interrupted before its terminal hooks.
+    mark_tool_errors(messages)
     return without_ephemeral(ModelMessagesTypeAdapter.dump_python(list(messages), mode="json"))
 
 
