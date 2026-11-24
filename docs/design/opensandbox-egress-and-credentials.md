@@ -28,7 +28,17 @@ browser tools or HTTP calls made by the AgenticOS backend.
 
 ## 1. Make the workspace independent of the sandbox
 
-**Use storage on the OpenSandbox side by default.** Mount one project or
+Reattaching by sandbox ID reopens the **same** sandbox; no volume is needed for
+that. A volume solves a different problem: a **new** sandbox can read the old
+files after the original sandbox is deleted.
+
+**Assumption:** a future Pydantic AI Harness release will accept the OpenSandbox
+SDK’s `volumes` argument on its backend and forward it to `Sandbox.create()`.
+AgenticOS will pass the approved mount when creating compute, not when
+reattaching. OpenSandbox mounts the storage; AgenticOS does not need a shared
+filesystem with the remote server.
+
+**Use storage on the OpenSandbox side.** Mount one project or
 conversation volume at `/workspace`. On Docker this is a named volume on the
 selected daemon; on Kubernetes it is a persistent volume claim (PVC) in the
 sandbox namespace. A path on the AgenticOS API server is not a path on a
@@ -182,22 +192,23 @@ See the [Credential Vault lifecycle][vault].
 
 ## Implementation and release gates
 
-The [locked dependencies](../../backend/uv.lock) and public APIs set two
-different implementation gates:
+The implementation baseline is the [AgenticOS v1.92.0 release lock][release-lock]:
+Pydantic AI Slim 2.71.0, Harness 0.71.0 and OpenSandbox SDK 1.2.1. This
+[design branch’s lock](../../backend/uv.lock) still pins Harness 0.68.0.
 
-- [OpenSandbox SDK 1.2.1][sdk] supports creation-time volumes, network policy
-  and credential proxy. The separate post-create vault write installs bindings.
-  [Volume and policy models][models] describe the provider contract.
-- [Harness 0.68.0][harness-068] owns creation, recovery tagging and cancellation;
-  it exposes neither volume forwarding nor the two outbound arguments.
-  [Harness 0.69.0][harness-069] forwards `network_policy` and `credential_proxy`
-  on the lower-level backend, **not volumes**. It requires the coordinated
-  [Pydantic AI 2.69.0 upgrade][pyd-269]. Leave `allow_internet_access` at its
-  default with an explicit policy. Use `get_sandbox()` before exposing tools.
-- For storage, obtain a supported public volume/create hook and verify recovery
-  and cancellation still work. Do not fork the private creation method or assume
-  the outbound upgrade unlocks mounts. Until then, keep durable storage off.
-  Keep lazy creation and no-retry behavior for unchanged connections.
+- **Storage:** [the SDK][sdk] accepts volumes at creation, but
+  [Harness 0.71.0][harness] does not forward them. Adopt a released Harness
+  version with public volume forwarding before enabling durable storage.
+  Exercise creation, cancellation and recovery through that public API; do not
+  override the private creation method. Leave mounts unset on existing connections.
+- **Outbound policy and credentials:** Harness 0.71.0 already forwards
+  `network_policy` and `credential_proxy` to the SDK. The
+  [released AgenticOS adapter][adapter] passes neither. Wire the settings into
+  that adapter without waiting for volume support. Leave `allow_internet_access`
+  at its default with an explicit policy. For credentialed runs, replace the
+  adapter’s `sandbox_timeout=None` with a finite lifetime and use
+  `get_sandbox()` to install bindings before exposing tools. Keep lazy creation
+  and existing retry behavior for unchanged connections.
 
 Enable features independently per verified connection. A shell probe or
 [existing Secure Access validation](../kubernetes.md#oidc-and-sandbox-configuration)
@@ -216,7 +227,7 @@ upstream TLS verification and authenticated, encrypted vault delivery.
 | Migration | Copy a stale-policy legacy workspace without agent execution. Interrupt before cutover: source is unchanged. Complete cutover: destination matches the source and a delayed cleanup cannot delete it. |
 | Outbound policy | On the target deployment, check an allowed name, a denied name and a disallowed address with no lease. Document shared-address limitations. Stale refs cannot run new work and changing a policy does not discard files. |
 | Credentials | Use only a throwaway token and controlled HTTPS endpoint. Only the approved host/method/path receives it. Cross-tenant grants, endpoint swaps, revoked grants, persistent scope overrides and parent-to-child sharing (including nested delegates) fail before handoff. No secret in logs or metadata. |
-| Cleanup | Stop the worker immediately after a successful vault write; separately fail normal destruction and time out provisioning. After restart, confirm teardown on the original server and no second sandbox creation. |
+| Cleanup | Stop the worker immediately after a successful vault write; separately fail normal destruction and time out provisioning. After restart, confirm teardown on the original server and no second sandbox creation. With the cleanup worker offline, confirm the provider expires credentialed compute at the configured lifetime. |
 
 If a gate fails, stop new admissions for that feature; keep cleanup and access
 to recovery records working. Disabling durable storage must not delete volumes
@@ -227,11 +238,10 @@ as such; do not infer support from a version string.
 [docker-volume]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/examples/docker-pvc-volume-mount.md
 [k8s-volume]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/examples/kubernetes-pvc-volume-mount.md
 [sdk]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/sdks/sandbox/python/src/opensandbox/sandbox.py
-[models]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/sdks/sandbox/python/src/opensandbox/models/sandboxes.py
 [vault]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/guides/credential-vault.md
-[harness-068]: https://pypi.org/project/pydantic-ai-harness/0.68.0/#files
-[harness-069]: https://pypi.org/project/pydantic-ai-harness/0.69.0/#files
-[pyd-269]: https://github.com/pydantic/pydantic-ai/releases/tag/v2.69.0
+[release-lock]: https://github.com/vstorm-co/agenticos/blob/v1.92.0/backend/uv.lock
+[adapter]: https://github.com/vstorm-co/agenticos/blob/v1.92.0/backend/app/agents/capabilities/sandbox/_opensandbox.py
+[harness]: https://pypi.org/project/pydantic-ai-harness/0.71.0/#files
 [server]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/server/configuration.md#egress
 [network]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/guides/network-security.md
 [egress]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/architecture/network/egress.md
