@@ -1,247 +1,173 @@
-# OpenSandbox workspaces: file persistence, outbound access and credentials
+# OpenSandbox workspaces: persistent files, browsing and outbound access
 
-**Proposal, 2026-11-23.** Keep the files, replace the compute, and authorize
-credentials for a run rather than for a directory. These are three separate
-features. The current integration does not provide these guarantees; the
-evidence below is repository and upstream source review, not a live test.
+**Proposal, 2026-11-24.** An agent writes `/workspace/report.md`. A conversation
+participant should be able to download the report from Files while the sandbox
+is running. If the sandbox is deleted but the workspace is retained, the same
+participant should still be able to download it, and the next authorized run
+should see the same file in a fresh sandbox. Neither the old process nor its
+credentials should survive. This is a design, not a tested deployment.
 
-## What should survive?
+## What works today, and what changes
 
-Suppose an agent writes `/workspace/report.md` in a project. A week later the
-sandbox has been deleted. The next authorized agent in that project should see
-the report in a fresh sandbox. It should **not** inherit the previous process,
-installed system packages, network policy or credentials.
-
-| Today | Where the files are | What happens when compute goes away |
+| Operation | Today | Proposed change |
 | --- | --- | --- |
-| [sandboxd](../sandbox.md#how-long-anything-survives) | A directory on the sandboxd host is mounted at `/workspace`. The Files panel can read it without starting a container. | Idle compute can be reaped while the directory stays. Workspace retention and explicit deletion are separate. |
-| [OpenSandbox adapter](../../backend/app/agents/capabilities/sandbox/_opensandbox.py) | AgenticOS requests an image but no workspace volume. Persistent scopes record a reference to the remote sandbox, not a copy of the files. | An idle but intact sandbox can be reattached. If unavailable, refuse rather than silently replace it. If destroyed, its private filesystem is not recoverable from the reference. |
+| Continue in the same sandbox | AgenticOS can reattach to an intact OpenSandbox sandbox by its recorded ID. | None. Reattachment does not need a volume or change existing mounts. |
+| Keep files across sandbox replacement | The [adapter][adapter] requests an image but no workspace volume. The sandbox ID is not a copy of its files. | Mount a retained volume when creating a sandbox for an opted-in project or conversation. |
+| Browse workspace files from the console | [sandboxd](../sandbox.md#how-long-anything-survives) can serve files without running the agent container. Agent tools can use OpenSandbox files, but the console does not browse them. | Use the existing Files UI and authorized routes, with separate readers for a live sandbox and a retained volume. |
+| Control outbound requests | The adapter does not pass a network policy or credential proxy. | Add connection-level network rules and, independently of storage, destination credentials for private runs. |
 
-**Delivery plan:** (1) opt-in durable files for new project and conversation
-workspaces; (2) connection-level outbound policy, usable with or without durable
-files; (3) outbound credentials for private, run-scoped compute only. Storage
-and egress can ship independently. Credentials require verified egress and
-crash-safe cleanup, **not** durable storage. Existing connections, published
-specs and recorded sandbox references retain their behavior unless explicitly
-migrated. This is for OpenSandbox agent workspaces, not sandboxd workflow code,
-browser tools or HTTP calls made by the AgenticOS backend.
+## Keep workspace files when compute is replaced
 
-## 1. Make the workspace independent of the sandbox
+[Pydantic AI Harness PR #14282][volumes-pr] is the upstream dependency. As of
+November 24 it is open: it adds `OpenSandboxBackend(volumes=...)` and forwards
+SDK `Volume` objects to `Sandbox.create()`. Omitting volumes leaves the creation
+request unchanged. It does not retrofit mounts on reattach, manage storage or
+provide a Files panel. Enable durable storage only with a released Harness
+version that includes this support.
 
-Reattaching by sandbox ID reopens the **same** sandbox; no volume is needed for
-that. A volume solves a different problem: a **new** sandbox can read the old
-files after the original sandbox is deleted.
+**Storage stays on the OpenSandbox side.** Mount one [Docker named volume][docker-volume]
+or [Kubernetes PVC][k8s-volume] at `/workspace`. The AgenticOS API server does
+not mount it. An operator enables a storage profile on a connection; the
+[workspace service](../../backend/app/services/sandbox_workspace.py) resolves
+the effective project or conversation, including scope overrides. Run-scoped
+scratch stays disposable. Existing workspaces keep their behavior unless
+explicitly migrated.
 
-**Assumption:** a future Pydantic AI Harness release will accept the OpenSandbox
-SDK’s `volumes` argument on its backend and forward it to `Sandbox.create()`.
-AgenticOS will pass the approved mount when creating compute, not when
-reattaching. OpenSandbox mounts the storage; AgenticOS does not need a shared
-filesystem with the remote server.
-
-**Use storage on the OpenSandbox side.** Mount one project or
-conversation volume at `/workspace`. On Docker this is a named volume on the
-selected daemon; on Kubernetes it is a persistent volume claim (PVC) in the
-sandbox namespace. A path on the AgenticOS API server is not a path on a
-remote worker. If the files must reside on infrastructure shared with
-AgenticOS, the operator can back a PVC with shared storage such as NFS. The API
-server need not mount it. Do not expose host paths, claim names or arbitrary
-mount definitions to agents. See the [Docker][docker-volume] and
-[Kubernetes][k8s-volume] examples.
-
-**Ownership.** Give an eligible connection an opt-in storage profile chosen by
-the operator. The [workspace service](../../backend/app/services/sandbox_workspace.py)
-resolves the effective scope (including project/exposure overrides) and owns two
-distinct records:
-
-| Record | What it identifies | Lifetime |
-| --- | --- | --- |
-| Workspace storage | Organization, owning project or conversation workspace, generation, approved storage location and provider volume identity | Until the owning workspace is explicitly deleted, moved or reaches its configured retention limit |
-| Compute attachment | Current sandbox ID, connection endpoint revision, storage generation, applied policy revision and writer lease | Until the sandbox stops or is retired; several successive sandboxes may use one volume |
-
-Use an opaque, server-allocated volume identity; verify ownership and location
-before mounting or deleting it. Don't adopt a pre-existing volume just because
-its name matches a reservation. Never take the volume name from the prompt,
-agent spec or caller. A rename, image change or connection edit must not silently
-select a different volume. A change of storage location requires a move.
-Run-scoped scratch remains disposable; other scopes stay on their existing path
-until they have an explicit ownership and retention contract.
-
-**Open and close.** Reserve the storage generation durably before first
-provisioning. Only that initial allocation may create a volume; reconcile an
-ambiguous result against the reservation. For all subsequent mounts require
-the recorded volume to exist (`createIfNotExists=false`). A missing or
-unverifiable volume is a recovery error, not consent to create an empty one.
-Keep `deleteOnSandboxTermination=false`. Set the mount on sandbox creation and
-verify it before handing the workspace to tools.
-
-Serialize writer acquisition across all runs using that generation. Reattach
-only to the matching sandbox and policy. Before mounting a replacement, prove
-the old writer is stopped or fence it from storage; an attach timeout or an
-expired database lease alone does neither. If the provider cannot confirm that
-condition, wait or report the workspace unavailable. Idle retirement releases
-compute, not the volume. Files outside `/workspace` are not promised to survive.
-
-**Move, migrate and delete.** Never mount a new volume over a legacy sandbox's
-only copy of its files. Reuse the [project transfer](../../backend/app/services/project_workspace_transfer.py)
-pattern: quiesce writers, copy into a new generation, verify the file tree and
-digests, then switch the active reference. Leave the source intact on failure.
-Give the transfer service a source-only, bounded file export when the old
-policy no longer permits normal opens. Do not return a shell or provision
-credentials on that path. If safe export isn't available, report the blocker;
-don't offer a move that requires bypassing the policy or a reset that loses files.
-
-Deleting the owning workspace must queue **volume** cleanup even when no sandbox
-ID remains. Commit the deletion intent with the ownership change, detach old
-compute first, and retry against the original location and generation, never
-the current target of an edited connection. Use a storage controller with
-scoped provision/inspect/delete authority; the pinned [lifecycle API][lifecycle]
-has no stand-alone volume deletion endpoint. Keep the feature off on deployments
-without a storage owner that can complete that cleanup. Verify reclaim behavior, quota
-and retention with the operator. A persistent volume is not a backup.
-
-**Scope limit:** this delivers files to the agent across sandbox replacement.
-It does not deliver sandboxd's offline Files panel or archive downloads. Those
-would need a separately authorized file-reading service when no compute exists;
-see [current OpenSandbox behavior](../sandbox.md).
-
-## 2. Apply outbound policy to new compute
-
-Add typed settings under **Settings → Sandboxes → Connections**, only for
-OpenSandbox. Keep SDK models inside the adapter, not in agent specs. Present
-these as *requested sandbox rules*, subject to deployment-wide rules:
-
-| Setting | Creation request |
+| Record | What AgenticOS keeps |
 | --- | --- |
-| Server defaults (existing behavior) | Omit policy. On classic deployments that can mean no egress sidecar, not a platform-enforced baseline. |
-| Deny by default, no exceptions | Default deny, empty rules |
-| Domain allowlist | Default deny with exact allow rules |
-| Domain blocklist | Default allow with exact deny rules |
+| Workspace storage | Organization, owning project or conversation, storage location, opaque provider volume ID and generation. Retain until owner deletion, migration or retention expiry. |
+| Compute attachment | Sandbox ID, connection endpoint revision, storage generation, applied policy revision and writer lease. Retiring compute does not retire storage. |
 
-Accept normalized domain names only: no schemes, paths, ports, IPs, CIDRs or
-wildcards. Explain the limit in the UI: DNS decides which names resolve;
-in `dns+nft` mode packet filtering also admits resolved **addresses** for a
-limited time. Two hostnames can share an address. This is not per-request
-hostname isolation. Operator exceptions and port restrictions also affect the
-result. A credential match, by contrast, checks an individual HTTPS request.
-See [egress architecture][egress] and [operator rules][network].
+- **Allocate once.** Reserve a generation before provisioning. Reconcile an
+  ambiguous create against that reservation; never adopt a volume by name
+  alone. Later mounts must require the recorded volume to exist
+  (`createIfNotExists=false`); keep `deleteOnSandboxTermination=false`. Agents
+  and callers cannot supply host paths, claim names or volume IDs.
+- **Replace safely.** Verify the mount and serialize writers. Before mounting
+  a replacement, confirm the previous writer stopped or prevent it from writing
+  to the volume. An expired lease or unreachable sandbox is not proof. If the
+  volume or writer cannot be verified, report the workspace unavailable rather
+  than serving empty storage.
+- **Move explicitly.** Never mount over the only copy of legacy files. Follow
+  the [project transfer](../../backend/app/services/project_workspace_transfer.py)
+  pattern: quiesce writers, copy, verify file digests, then switch generations.
+  Leave the source intact on failure. If policy blocks a normal open, allow
+  only a bounded source export without a shell or credentials; otherwise
+  report that the move is blocked.
+- **Delete by ownership.** Queue cleanup with the ownership change, even when
+  no sandbox ID remains. Detach users of the volume, including file readers,
+  then retry deletion against its original location and generation. An edited
+  connection must never redirect cleanup. The [OpenSandbox lifecycle API][lifecycle]
+  has no standalone volume deletion operation; enable retention only where a
+  storage controller can verify ownership, reclaim storage and enforce quota.
 
-Record the applied revision on each compute attachment. A change governs new
-work, not already running processes. Refuse normal use of a stale attachment,
-including recorded-ref operations; don't redirect an operation intended for an
-old sandbox to a replacement. For durable files, retire the old writer before
-starting new compute against the same volume. For legacy files, require an
-explicit verified move or destructive reset. Refs with no revision remain
-eligible only for the unchanged legacy default. Do not patch an old policy
-in place: SDK rule edits do not replace its default action.
+## Browse files from AgenticOS
 
-## 3. Grant outbound credentials to a private run
+Reuse the existing conversation and project file routes for listing, text
+preview and byte downloads. Keep folder ZIP downloads where the route already
+supports them. For conversation files, preserve conversation read access,
+including shares; for project files, preserve project view access. Check each
+request, not just the listing. AgenticOS selects the reader from its records;
+the browser supplies only a relative path within the authorized workspace,
+never a provider endpoint, sandbox ID or PVC name. This adds browsing, not
+project editing or a general-purpose shell.
 
-There are two different keys. The **connection key** lets AgenticOS talk to
-OpenSandbox. The **destination credential** lets a matching request from a
-sandbox call an approved upstream. Never put the latter in the image, mount,
-command line, environment, spec, response, audit payload or logs.
-
-- **Grant:** A principal authorized to use the specific organization
-  [HTTP credential](../secrets.md) and manage the agent binding approves the
-  agent, allowed run context, connection and control-plane endpoint revision.
-  The spec references that binding, never an arbitrary secret/URL pair. A
-  connection UUID is insufficient: its server address can change. Invalidate
-  approval on endpoint change, including when editing the same connection.
-  Use the same approved endpoint for the write; never follow a redirect or
-  re-resolve a changed default to deliver plaintext elsewhere.
-- **Destination:** Require an exact HTTPS origin on port 443 accepted by the
-  sealed credential's [origin check](../../backend/app/core/secret_kinds.py),
-  an explicit domain allow rule, methods, narrow paths, and bearer or named
-  API-key header auth. Reject conflicting matches. No automatic host additions,
-  wildcard grants, personal credentials, substitutions or token exchanges.
-  A trusted upstream may still return sensitive data in its response.
-- **Run:** Validate at publish; recheck the actual principal, exposure, agent,
-  grant, effective scope, endpoint and policy before opening tools or unsealing
-  the credential. [Vault lookup](../../backend/app/services/organization_secret.py)
-  is not authorization. Don't inherit the publisher's authority for an
-  unapproved caller. First release: private run-scoped scratch only, **no
-  shared durable mounts and no delegate handoff**. Reject incompatible sharing
-  at publish and guard the [runtime handoff](../../backend/app/services/agent_runner.py)
-  too, including nested delegates: they otherwise receive the already-open
-  backend without another workspace open.
-
-**Provisioning order matters.** Run scope today has no persistent workspace row,
-and normal release destroys through an in-memory ref. Add a committed run-owned
-cleanup lease, not just an exception handler:
-
-1. Reserve an attempt with the approved endpoint and recovery identity before
-   creation. Create once with a finite provider lifetime, explicit default-deny
-   policy and credential proxy. Reconcile ambiguous creation; don't retry it
-   blindly or let tools use an unverified sandbox.
-2. Commit the returned sandbox ID to the lease **before** the vault write. If
-   that commit fails, do not send the secret. Verify the policy, populate the
-   sidecar from the trusted control plane, then verify sanitized binding
-   metadata before making any tool available.
-3. On completion, cancellation, failed or ambiguous provisioning, or loss of
-   the owning worker, destroy that sandbox. A recovery worker claims abandoned
-   leases, retries cleanup, and clears the record only on confirmed absence.
-   Don't unseal the destination credential to clean up. Preserve the original
-   teardown route while a lease exists.
-
-Grant revocation stops new admissions. To end an active grant, terminate its
-sandbox; for emergency revocation, revoke the upstream token too. The classic
-sidecar vault is in memory: Kubernetes pause/resume loses it, Docker unpause
-preserves it only while the sidecar survives. Don't resume a credentialed run
-on an empty vault or silently inject its credential into shared compute.
-See the [Credential Vault lifecycle][vault].
-
-## Implementation and release gates
-
-The implementation baseline is the [AgenticOS v1.92.0 release lock][release-lock]:
-Pydantic AI Slim 2.71.0, Harness 0.71.0 and OpenSandbox SDK 1.2.1. This
-[design branch’s lock](../../backend/uv.lock) still pins Harness 0.68.0.
-
-- **Storage:** [the SDK][sdk] accepts volumes at creation, but
-  [Harness 0.71.0][harness] does not forward them. Adopt a released Harness
-  version with public volume forwarding before enabling durable storage.
-  Exercise creation, cancellation and recovery through that public API; do not
-  override the private creation method. Leave mounts unset on existing connections.
-- **Outbound policy and credentials:** Harness 0.71.0 already forwards
-  `network_policy` and `credential_proxy` to the SDK. The
-  [released AgenticOS adapter][adapter] passes neither. Wire the settings into
-  that adapter without waiting for volume support. Leave `allow_internet_access`
-  at its default with an explicit policy. For credentialed runs, replace the
-  adapter’s `sandbox_timeout=None` with a finite lifetime and use
-  `get_sandbox()` to install bindings before exposing tools. Keep lazy creation
-  and existing retry behavior for unchanged connections.
-
-Enable features independently per verified connection. A shell probe or
-[existing Secure Access validation](../kubernetes.md#oidc-and-sandbox-configuration)
-demonstrates neither volume retention nor outbound enforcement; Secure Access
-protects inbound endpoints. Pin the tested server, controller/execd and egress
-images. For the outbound phases, configure [server egress][server] with an
-egress image and `dns+nft`; DNS-only mode is insufficient. Validate Docker
-bridge networking or Kubernetes nftables and sidecar `NET_ADMIN` as applicable.
-Exclude unsupported gVisor, transparent mesh interception and Fast Sandbox
-profiles from the initial sidecar rollout. Verify interception CA trust,
-upstream TLS verification and authenticated, encrypted vault delivery.
-
-| Gate | Evidence required before enabling |
+| Workspace state | How Files reads it |
 | --- | --- |
-| Durable storage | On each supported runtime, write a file, destroy the sandbox, create a different sandbox, read identical bytes. An absent volume fails closed. A second tenant cannot select it. An unreachable or concurrent writer cannot cause two writable attachments. Deleting a conversation/project with no live compute purges only its volume. |
-| Migration | Copy a stale-policy legacy workspace without agent execution. Interrupt before cutover: source is unchanged. Complete cutover: destination matches the source and a delayed cleanup cannot delete it. |
-| Outbound policy | On the target deployment, check an allowed name, a denied name and a disallowed address with no lease. Document shared-address limitations. Stale refs cannot run new work and changing a policy does not discard files. |
-| Credentials | Use only a throwaway token and controlled HTTPS endpoint. Only the approved host/method/path receives it. Cross-tenant grants, endpoint swaps, revoked grants, persistent scope overrides and parent-to-child sharing (including nested delegates) fail before handoff. No secret in logs or metadata. |
-| Cleanup | Stop the worker immediately after a successful vault write; separately fail normal destruction and time out provisioning. After restart, confirm teardown on the original server and no second sandbox creation. With the cleanup worker offline, confirm the provider expires credentialed compute at the configured lifetime. |
+| Sandbox running | Use the recorded, authorized attachment and OpenSandbox’s file API for directory listings and file bytes. No volume or agent run is required. Do not create a sandbox on a failed attach or silently switch to a different one. |
+| Sandbox deleted; volume retained | Use a short-lived reader on the OpenSandbox side with only the recorded generation mounted read-only. It serves files without recreating the agent sandbox or provisioning its credentials. Release the mount after the read, including on cancellation. |
+| No readable sandbox or retained volume | Report unavailable. Opening Files must never create an empty volume or present a provider failure as an empty folder. |
 
-If a gate fails, stop new admissions for that feature; keep cleanup and access
-to recovery records working. Disabling durable storage must not delete volumes
-or reinterpret existing workspaces as empty scratch. Report unverified features
-as such; do not infer support from a version string.
+Both readers must confine lookup **and** opening the file to the workspace
+root. The [native download handler][execd-read] accepts sandbox paths; prefixing
+a user path with `/workspace` is not confinement. Require a trusted reader that
+cannot follow links outside the root, including during concurrent changes. If
+the live deployment cannot enforce this, do not expose raw SDK reads. Serve
+only regular files, preserve the [existing listing filters](../sandbox.md#what-the-file-browser-shows-and-what-it-leaves-out),
+and apply entry, byte and time bounds to listings, previews and downloads.
 
-[lifecycle]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/specs/sandbox-lifecycle.yml
+Live browsing can ship without Harness volume forwarding. Offline browsing
+requires both durable storage **and** the read-only helper. If the helper
+cannot mount that volume on the selected Docker host or Kubernetes cluster,
+report offline browsing as unavailable; do not request a writable mount instead.
+
+## Apply outbound policy to new compute
+
+Under **Settings → Sandboxes → Connections**, let an operator choose server
+defaults (omit policy), deny-all, a domain allowlist (default deny), or a domain
+blocklist (default allow). Server defaults do not guarantee egress filtering.
+Accept exact normalized domains only, not URLs, ports, IPs, CIDRs or wildcards.
+Explain that [DNS and packet filtering][egress] admit resolved addresses for a
+limited time; names sharing an address are not isolated from each other.
+Deployment rules and port restrictions still apply.
+
+Record the applied policy revision on the attachment. Policy changes govern
+new work, not running processes. Refuse new work on a stale attachment,
+including direct ref operations; never redirect an operation targeting that
+ref to another sandbox. Retire the previous writer before replacing durable
+compute. Require verified migration or explicit reset for legacy files. Keep
+unversioned refs usable only under the unchanged legacy default.
+
+## Grant destination credentials to private runs
+
+The connection key authenticates AgenticOS to OpenSandbox. A **destination
+credential** authenticates a matching outbound HTTPS request. Never place it
+in the workspace, environment, command, spec, response, audit payload or logs.
+
+- **Authorize the binding.** A principal with access to the specific organization
+  [HTTP credential](../secrets.md) and authority to manage the agent binding
+  approves the agent, run context, connection and endpoint revision. Validate at
+  publish; before unsealing, recheck the caller, exposure, effective scope,
+  destination, policy and endpoint. Changing the endpoint invalidates approval;
+  never follow a redirect when delivering the secret.
+- **Narrow the destination.** Require an explicit domain allow rule, the sealed
+  credential’s [exact HTTPS origin](../../backend/app/core/secret_kinds.py) on
+  port 443, allowed methods and narrow paths. Support bearer or named API-key
+  headers; reject overlapping bindings, wildcards and personal credentials.
+- **Isolate the run.** Use private run-scoped scratch only. No shared volumes or
+  delegate handoff: guard publish and runtime, including nested delegates that
+  would otherwise inherit the already-open backend.
+- **Provision before handing out tools.** Commit an attempt with the approved
+  endpoint and recovery identity. Create once with finite provider lifetime,
+  default-deny policy and credential proxy; reconcile uncertain creation.
+  Commit its sandbox ID **before** the vault write. Verify policy, install
+  bindings via the trusted control plane and verify sanitized metadata before
+  giving the agent access.
+- **Recover and revoke.** Destroy on completion, failure or cancellation. A
+  recovery worker claims abandoned attempts and retries on the original
+  endpoint until absence is confirmed, without unsealing the secret. Revocation
+  blocks new admissions; terminate the sandbox to end active use and revoke the
+  upstream token in an emergency. Do not resume a credentialed run after its
+  [sidecar vault][vault] has lost the binding.
+
+## What to verify before enabling each feature
+
+The [AgenticOS v1.93.0 lockfile][release-lock] pins Harness 0.71.0 and OpenSandbox
+SDK 1.2.1. Outbound policy and credentials do **not** depend on the volumes PR:
+Harness already forwards `network_policy` and `credential_proxy`. Wire them
+into the adapter, leave `allow_internet_access` at its default with an explicit
+policy, and replace `sandbox_timeout=None` with a finite lifetime for
+credentialed runs only. Preserve existing lazy creation on unchanged connections.
+
+| Feature | Acceptance check |
+| --- | --- |
+| Durable storage | On each supported runtime, write a file, destroy compute, mount the same volume in a different sandbox and compare bytes. Test cancelled creation and recovery, missing volumes, concurrent writers, tenant isolation and deletion without a live sandbox. |
+| Migration | Interrupt before cutover: source intact. Complete cutover: destination matches. Delayed cleanup cannot delete the new generation. |
+| Live Files | List, preview and download an agent-written file via the console; verify binary bytes. Deny unauthorized reads, path escapes and link swaps. A failed attach does not start compute. |
+| Offline Files | Delete compute, then list and download the same bytes from the retained volume with no agent run or credentials. Enforce the same access checks and bounds; verify the mount is read-only, reader cleanup runs on cancellation, and missing storage is not recreated. |
+| Outbound policy | Verify the target deployment’s egress image and `dns+nft` enforcement with an allowed name, denied name and disallowed address. A stale ref cannot start new work; a policy change does not discard files. |
+| Credentials | Verify trusted TLS and authenticated vault delivery. With a throwaway token, only the approved origin, method and path receive it. Endpoint changes, revoked grants, cross-tenant use, shared scopes and delegate handoffs fail before tool use. Logs and metadata contain no token. |
+| Cleanup | Stop the worker after a vault write; separately fail destruction and time out creation. Verify recovery on the original endpoint without duplicate creation, and provider expiry while cleanup is offline. |
+
+Enable each feature per verified connection. Disabling a feature stops new use;
+it must not erase retained files, lose recovery records or prevent cleanup.
+
+[volumes-pr]: https://github.com/pydantic/pydantic-ai/pull/14282
+[release-lock]: https://github.com/vstorm-co/agenticos/blob/v1.93.0/backend/uv.lock
+[adapter]: https://github.com/vstorm-co/agenticos/blob/v1.93.0/backend/app/agents/capabilities/sandbox/_opensandbox.py
 [docker-volume]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/examples/docker-pvc-volume-mount.md
 [k8s-volume]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/examples/kubernetes-pvc-volume-mount.md
-[sdk]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/sdks/sandbox/python/src/opensandbox/sandbox.py
-[vault]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/guides/credential-vault.md
-[release-lock]: https://github.com/vstorm-co/agenticos/blob/v1.92.0/backend/uv.lock
-[adapter]: https://github.com/vstorm-co/agenticos/blob/v1.92.0/backend/app/agents/capabilities/sandbox/_opensandbox.py
-[harness]: https://pypi.org/project/pydantic-ai-harness/0.71.0/#files
-[server]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/server/configuration.md#egress
-[network]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/guides/network-security.md
+[lifecycle]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/specs/sandbox-lifecycle.yml
+[execd-read]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/components/execd/pkg/web/controller/filesystem_download.go
 [egress]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/architecture/network/egress.md
+[vault]: https://github.com/opensandbox-group/OpenSandbox/blob/release-1.2.1/docs/guides/credential-vault.md
